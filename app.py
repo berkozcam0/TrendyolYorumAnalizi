@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string, request, session
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
+import json
 
 # =========================
 # ENV LOAD
@@ -128,57 +129,59 @@ def fuse_sentiment(label: str, score: float, star: int) -> str:
 # =========================
 # DATA FETCHING
 # =========================
+import urllib.parse
+
+
 def fetch_reviews(content_id: str, max_pages: int = 25) -> pd.DataFrame:
     all_reviews = []
 
-    # Trendyol'un veri merkezi IP'lerini engellemesini zorlaştırmak için gerçekçi tarayıcı bilgileri ekliyoruz
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": "tr-TR,tr;q=0.9",
         "Origin": "https://www.trendyol.com",
         "Referer": "https://www.trendyol.com/"
     }
 
     for page in range(max_pages):
-        params = {
-            "contentId": content_id,
-            "page": page,
-            "pageSize": 20,
-            "order": "DESC",
-            "orderBy": "Score",
-            "channelId": 1,
-        }
+        target_url = f"https://apigw.trendyol.com/discovery-storefront-trproductgw-service/api/review-read/product-reviews/detailed?contentId={content_id}&page={page}&pageSize=20&channelId=1"
 
-        # İstek atarken headers parametresini ekledik
-        resp = requests.get(API_URL, params=params, headers=headers, timeout=20)
+        encoded_url = urllib.parse.quote(target_url)
 
-        if resp.status_code == 403:
-            raise RuntimeError("Trendyol güvenlik duvarı sunucu isteğini engelledi (403). Lütfen tekrar deneyin.")
-        elif resp.status_code != 200:
-            raise RuntimeError(f"Trendyol API hatası: {resp.status_code}")
+        proxy_url = f"https://api.allorigins.win/get?url={encoded_url}"
 
-        reviews = resp.json().get("result", {}).get("reviews", [])
-        if not reviews:
-            break
+        try:
+            resp = requests.get(proxy_url, headers=headers, timeout=15)
 
-        for r in reviews:
-            try:
-                tarih = datetime.fromtimestamp(r.get("createdAt", 0) / 1000).strftime("%d.%m.%Y")
-            except Exception:
-                tarih = ""
-            all_reviews.append({
-                "Kullanıcı": r.get("userFullName", ""),
-                "Yorum": r.get("comment", ""),
-                "Yıldız": r.get("rate", 0),
-                "Tarih": tarih,
-                "Beğeni": r.get("likesCount", 0),
-                "Satıcı": r.get("seller", {}).get("name", ""),
-            })
-        time.sleep(0.3)  # Engellenme riskini azaltmak için bekleme süresini hafifçe artırdık
+            if resp.status_code != 200:
+                break
+
+            proxy_data = resp.json()
+            actual_data = json.loads(proxy_data.get("contents", "{}"))
+
+            reviews = actual_data.get("result", {}).get("reviews", [])
+            if not reviews:
+                break
+
+            for r in reviews:
+                try:
+                    tarih = datetime.fromtimestamp(r.get("createdAt", 0) / 1000).strftime("%d.%m.%Y")
+                except:
+                    tarih = ""
+                all_reviews.append({
+                    "Kullanıcı": r.get("userFullName", ""),
+                    "Yorum": r.get("comment", ""),
+                    "Yıldız": r.get("rate", 0),
+                    "Tarih": tarih,
+                    "Beğeni": r.get("likesCount", 0),
+                    "Satıcı": r.get("seller", {}).get("name", ""),
+                })
+            time.sleep(0.5)
+        except Exception as e:
+            raise RuntimeError(f"Bağlantı Hatası: {str(e)}")
 
     if not all_reviews:
-        raise RuntimeError("Bu ürün için yorum bulunamadı.")
+        raise RuntimeError("Trendyol güvenlik duvarı sunucu isteğini engelledi (403). Lütfen tekrar deneyin.")
     return pd.DataFrame(all_reviews)
 
 
