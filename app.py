@@ -52,14 +52,9 @@ HF_HEADERS = {"Authorization": f"Bearer {os.getenv('HF_TOKEN')}"}
 
 
 def query_sentiment_api(texts: list[str]) -> list[dict]:
-    """
-    Ağır BERT modelini sunucuda çalıştırmak yerine
-    Hugging Face'in ücretsiz API'sine gönderip sonuçları alırız.
-    """
     try:
         response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": texts}, timeout=20)
 
-        # Model Hugging Face tarafında uyku modundaysa (503 dönerse) uyanmasını bekleyelim
         if response.status_code == 503:
             time.sleep(15)
             response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": texts}, timeout=20)
@@ -299,21 +294,17 @@ def analyze_product(url: str) -> dict:
     content_id = extract_content_id(url)
     df = fetch_reviews(content_id)
 
-    # Sentiment analysis (Hafifletilmiş API Çağrısı)
     clean_texts = [metin_temizle(y) or "nötr" for y in df["Yorum"]]
     results = query_sentiment_api(clean_texts)
 
-    # Label mapping + güven skoru
     df["Duygu Analizi"] = [LABEL_MAP.get(r["label"], r["label"]) for r in results]
     df["Güven Skoru"] = [r["score"] for r in results]
 
-    # Yıldız füzyonu
     df["Duygu Analizi"] = df.apply(
         lambda row: fuse_sentiment(row["Duygu Analizi"], row["Güven Skoru"], row["Yıldız"]),
         axis=1,
     )
 
-    # Stats
     counts = df["Duygu Analizi"].value_counts()
     ratios = df["Duygu Analizi"].value_counts(normalize=True) * 100
     pos_count = int(counts.get("positive", 0))
@@ -390,10 +381,8 @@ HTML = """<!doctype html>
     line-height: 1.5;
   }
 
-  /* ── LAYOUT ── */
   .shell { max-width: 1200px; margin: 0 auto; padding: 28px 20px 60px; }
 
-  /* ── TOPBAR ── */
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
     gap: 16px; margin-bottom: 28px;
@@ -423,7 +412,6 @@ HTML = """<!doctype html>
   .status-dot.done { background: var(--green); box-shadow: 0 0 8px var(--green); animation: none; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-  /* ── INPUT ── */
   .input-row {
     display: flex; gap: 10px; margin-bottom: 20px;
     background: var(--surface); border: 1px solid var(--border);
@@ -449,7 +437,6 @@ HTML = """<!doctype html>
   .btn-primary:active { transform: scale(.98); }
   .btn-primary:disabled { opacity: .5; cursor: wait; }
 
-  /* ── PROGRESS ── */
   .progress-bar-wrap {
     display: none; height: 3px; background: var(--surface2);
     border-radius: 99px; margin-bottom: 20px; overflow: hidden;
@@ -465,14 +452,12 @@ HTML = """<!doctype html>
     100%{transform:translateX(300%) scaleX(.5)}
   }
 
-  /* ── NOTICE ── */
   .notice {
     display: none; padding: 12px 16px; border-radius: 8px;
     background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.3);
     color: #f85149; font-size: 13px; margin-bottom: 20px;
   }
 
-  /* ── EMPTY STATE ── */
   .empty-state {
     border: 1px dashed var(--border); border-radius: var(--radius);
     padding: 60px 32px; text-align: center; color: var(--ink3);
@@ -480,11 +465,9 @@ HTML = """<!doctype html>
   .empty-state-icon { font-size: 36px; margin-bottom: 12px; }
   .empty-state p { font-size: 14px; max-width: 360px; margin: 0 auto; }
 
-  /* ── DASHBOARD ── */
   .dashboard { display: none; }
   .dashboard.ready { display: block; }
 
-  /* ── METRICS ── */
   .metrics {
     display: grid;
     grid-template-columns: repeat(5, 1fr);
@@ -500,16 +483,15 @@ HTML = """<!doctype html>
   .metric-value { font-family: var(--mono); font-size: 28px; font-weight: 500; line-height: 1; }
   .metric-value.positive { color: var(--green); }
   .metric-value.negative { color: var(--red); }
-  .metric-value.orange { color: var(--orange); }
+  .metric-value.neutral  { color: var(--ink2); }
+  .metric-value.orange   { color: var(--orange); }
 
-  /* ── MAIN GRID ── */
   .main-grid {
     display: grid;
     grid-template-columns: 1fr 380px;
     gap: 16px;
   }
 
-  /* ── PANEL ── */
   .panel {
     background: var(--surface); border: 1px solid var(--border2);
     border-radius: var(--radius); overflow: hidden;
@@ -526,7 +508,7 @@ HTML = """<!doctype html>
   .gauge-wrap { display: flex; flex-direction: column; align-items: center; margin-bottom: 20px; }
   .gauge-svg { overflow: visible; display: block; }
   .gauge-legend {
-    display: flex; gap: 20px; margin-top: 10px; font-size: 13px;
+    display: flex; gap: 16px; margin-top: 10px; font-size: 13px; flex-wrap: wrap; justify-content: center;
   }
   .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
 
@@ -615,7 +597,6 @@ HTML = """<!doctype html>
   .btn-send:hover { filter: brightness(1.1); }
   .btn-send:disabled { opacity: .4; cursor: not-allowed; }
 
-  /* ── RESPONSIVE ── */
   @media (max-width: 900px) {
     .main-grid { grid-template-columns: 1fr; }
     .metrics { grid-template-columns: repeat(3, 1fr); }
@@ -679,8 +660,8 @@ HTML = """<!doctype html>
         <div class="metric-value negative" id="mNeg">—</div>
       </div>
       <div class="metric">
-        <div class="metric-label">Güven</div>
-        <div class="metric-value orange" id="mConf">—</div>
+        <div class="metric-label">Nötr</div>
+        <div class="metric-value neutral" id="mNeu">—</div>
       </div>
     </div>
 
@@ -700,33 +681,56 @@ HTML = """<!doctype html>
                   <stop offset="0%" style="stop-color:#2ea043"/>
                   <stop offset="100%" style="stop-color:#56d364"/>
                 </linearGradient>
+                <linearGradient id="neuGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" style="stop-color:#6e7681"/>
+                  <stop offset="100%" style="stop-color:#8b949e"/>
+                </linearGradient>
                 <linearGradient id="negGrad" x1="0%" y1="0%" x2="100%" y2="0%">
                   <stop offset="0%" style="stop-color:#f85149"/>
                   <stop offset="100%" style="stop-color:#da3633"/>
                 </linearGradient>
               </defs>
+
+              <!-- Track (background arc) -->
               <path fill="none" stroke="#1c2330" stroke-width="16" stroke-linecap="butt"
                     d="M25,135 A105,105 0 0,1 235,135"/>
-              <path id="gaugePos" fill="none" stroke="url(#posGrad)" stroke-width="16" stroke-linecap="round"
+
+              <!-- Segment 1: Positive (green) — draws from left -->
+              <path id="gaugePos" fill="none" stroke="url(#posGrad)" stroke-width="16" stroke-linecap="butt"
                     d="M25,135 A105,105 0 0,1 235,135"
-                    style="stroke-dasharray:330; stroke-dashoffset:330; transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1)"/>
-              <path id="gaugeNeg" fill="none" stroke="url(#negGrad)" stroke-width="16" stroke-linecap="round"
-                    d="M235,135 A105,105 0 0,0 25,135"
-                    style="stroke-dasharray:330; stroke-dashoffset:330; transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1) .15s"/>
+                    style="stroke-dasharray:0 330; stroke-dashoffset:0; transition:stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1)"/>
+
+              <!-- Segment 2: Neutral (gray) — offset after positive -->
+              <path id="gaugeNeu" fill="none" stroke="url(#neuGrad)" stroke-width="16" stroke-linecap="butt"
+                    d="M25,135 A105,105 0 0,1 235,135"
+                    style="stroke-dasharray:0 330; stroke-dashoffset:0; transition:stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1) .1s, stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1) .1s"/>
+
+              <!-- Segment 3: Negative (red) — offset after positive + neutral -->
+              <path id="gaugeNeg" fill="none" stroke="url(#negGrad)" stroke-width="16" stroke-linecap="butt"
+                    d="M25,135 A105,105 0 0,1 235,135"
+                    style="stroke-dasharray:0 330; stroke-dashoffset:0; transition:stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1) .2s, stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1) .2s"/>
+
+              <!-- Needle -->
               <line id="gaugeNeedle" x1="130" y1="135" x2="130" y2="42"
                     stroke="#c9d1d9" stroke-width="2.5" stroke-linecap="round"
                     style="transform-origin:130px 135px; transform:rotate(-90deg); transition:transform 1.2s cubic-bezier(.4,0,.2,1) .1s"/>
               <circle cx="130" cy="135" r="5" fill="#c9d1d9"/>
+
+              <!-- Center text -->
               <text id="gaugeCenter" x="130" y="116" text-anchor="middle"
                     font-size="20" font-weight="700" fill="#e6edf3"
                     font-family="JetBrains Mono,monospace">—</text>
               <text id="gaugeSub" x="130" y="131" text-anchor="middle"
                     font-size="10" fill="#8b949e" font-family="Inter,sans-serif">olumlu</text>
+
+              <!-- Emoji anchors -->
               <text x="8" y="151" font-size="18" fill="#8b949e">😊</text>
               <text x="228" y="151" font-size="18" fill="#8b949e">😕</text>
             </svg>
+
             <div class="gauge-legend">
               <span><span class="legend-dot" style="background:var(--green)"></span><span id="legendPos">Olumlu —</span></span>
+              <span><span class="legend-dot" style="background:var(--ink3)"></span><span id="legendNeu">Nötr —</span></span>
               <span><span class="legend-dot" style="background:var(--red)"></span><span id="legendNeg">Olumsuz —</span></span>
             </div>
           </div>
@@ -813,20 +817,44 @@ function setReviewList(id, items, cls) {
   });
 }
 
-function animateGauge(posPercent, negPercent) {
-  const ARC_LEN = 330;
-  const posOffset = ARC_LEN - (posPercent / 100) * ARC_LEN;
-  const negOffset = ARC_LEN - (negPercent / 100) * ARC_LEN;
+// ── THREE-SEGMENT GAUGE ──
+// Arc total length = 330 px
+// Order left→right: Positive (green) | Neutral (gray) | Negative (red)
+// Each segment uses stroke-dasharray + stroke-dashoffset to "start" at the right position.
+function animateGauge(posPercent, neuPercent, negPercent) {
+  const ARC = 330;
+
+  const posLen = (posPercent / 100) * ARC;
+  const neuLen = (neuPercent / 100) * ARC;
+  const negLen = (negPercent / 100) * ARC;
 
   setTimeout(() => {
-    document.getElementById('gaugePos').style.strokeDashoffset = posOffset;
-    document.getElementById('gaugeNeg').style.strokeDashoffset = negOffset;
+    // Segment 1 — Positive: starts at 0, length = posLen
+    const elPos = document.getElementById('gaugePos');
+    elPos.style.strokeDasharray  = `${posLen} ${ARC - posLen}`;
+    elPos.style.strokeDashoffset = '0';
+
+    // Segment 2 — Neutral: starts after positive segment
+    // dashoffset = -(posLen) shifts the drawn dash forward by posLen
+    const elNeu = document.getElementById('gaugeNeu');
+    elNeu.style.strokeDasharray  = `${neuLen} ${ARC - neuLen}`;
+    elNeu.style.strokeDashoffset = `${-posLen}`;
+
+    // Segment 3 — Negative: starts after positive + neutral
+    const elNeg = document.getElementById('gaugeNeg');
+    elNeg.style.strokeDasharray  = `${negLen} ${ARC - negLen}`;
+    elNeg.style.strokeDashoffset = `${-(posLen + neuLen)}`;
+
+    // Needle: -90deg = full left (all positive), 0deg = center, +90deg = full right (all negative)
     const angle = ((negPercent - posPercent) / 100) * 90;
     document.getElementById('gaugeNeedle').style.transform = `rotate(${angle}deg)`;
+
+    // Center label
     document.getElementById('gaugeCenter').textContent = `%${posPercent.toFixed(0)}`;
   }, 100);
 
   $('legendPos').textContent = `Olumlu %${posPercent.toFixed(1)}`;
+  $('legendNeu').textContent = `Nötr %${neuPercent.toFixed(1)}`;
   $('legendNeg').textContent = `Olumsuz %${negPercent.toFixed(1)}`;
 }
 
@@ -834,14 +862,16 @@ function renderDashboard(data) {
   const s = data.summary;
   const sent = s.sentiment;
 
-  $('mTotal').textContent = s.total_reviews.toLocaleString('tr');
+  $('mTotal').textContent  = s.total_reviews.toLocaleString('tr');
   $('mRating').textContent = s.average_rating.toFixed(2);
-  $('mPos').textContent = `%${sent.positive.percent.toFixed(1)}`;
-  $('mNeg').textContent = `%${sent.negative.percent.toFixed(1)}`;
-  $('mConf').textContent = `%${s.confidence_score.toFixed(1)}`;
+  $('mPos').textContent    = `%${sent.positive.percent.toFixed(1)}`;
+  $('mNeg').textContent    = `%${sent.negative.percent.toFixed(1)}`;
+  $('mNeu').textContent    = `%${sent.neutral.percent.toFixed(1)}`;
   $('productIdLabel').textContent = `ID: ${s.content_id}`;
 
-  animateGauge(sent.positive.percent, sent.negative.percent);
+  // Pass all three values — neutral is now shown on gauge
+  animateGauge(sent.positive.percent, sent.neutral.percent, sent.negative.percent);
+
   setReviewList('posReviews', s.featured_positive, 'pos');
   setReviewList('negReviews', s.featured_negative, 'neg');
 
