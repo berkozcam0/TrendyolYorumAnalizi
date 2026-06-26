@@ -7,11 +7,13 @@ from groq import Groq
 import numpy as np
 import pandas as pd
 import requests
+import torch
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string, request, session
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
-import json
+from transformers import pipeline
+
 
 # =========================
 # ENV LOAD
@@ -46,37 +48,22 @@ LABEL_MAP = {
 }
 
 # =========================
-# SENTIMENT API (HUGGING FACE INFERENCE)
+# SENTIMENT PIPELINE
 # =========================
-HF_API_URL = "https://api-inference.huggingface.co/models/saribasmetehan/bert-base-turkish-sentiment-analysis"
-HF_HEADERS = {"Authorization": f"Bearer {os.getenv('HF_TOKEN')}"}
+_sentiment_pipeline = None
 
 
-def query_sentiment_api(texts: list[str]) -> list[dict]:
-    try:
-        response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": texts}, timeout=20)
-
-        if response.status_code == 503:
-            time.sleep(15)
-            response = requests.post(HF_API_URL, headers=HF_HEADERS, json={"inputs": texts}, timeout=20)
-
-        if response.status_code != 200:
-            raise RuntimeError(f"Hugging Face API Hatası: {response.status_code} - {response.text}")
-
-        raw_results = response.json()
-
-        formatted_results = []
-        for res in raw_results:
-            if isinstance(res, list) and len(res) > 0:
-                best_match = max(res, key=lambda x: x['score'])
-                formatted_results.append(best_match)
-            else:
-                formatted_results.append({"label": "LABEL_0", "score": 0.50})
-        return formatted_results
-
-    except Exception as exc:
-        print(f"HF API hatası: {exc}")
-        return [{"label": "LABEL_0", "score": 0.50} for _ in texts]
+def get_sentiment_pipeline():
+    global _sentiment_pipeline
+    if _sentiment_pipeline is None:
+        device = 0 if torch.cuda.is_available() else -1
+        _sentiment_pipeline = pipeline(
+            task="text-classification",
+            model="saribasmetehan/bert-base-turkish-sentiment-analysis",
+            tokenizer="saribasmetehan/bert-base-turkish-sentiment-analysis",
+            device=device,
+        )
+    return _sentiment_pipeline
 
 
 # =========================
@@ -117,72 +104,64 @@ def get_turkish_stopwords() -> list[str]:
 # YILDIZ + MODEL FÜZYONU
 # =========================
 def fuse_sentiment(label: str, score: float, star: int) -> str:
+    """
+    Model tahmini ile yıldız skorunu birleştir.
+    Yıldız 1-2 → kesinlikle negatif
+    Yıldız 4-5 → modelin negatif dediği ama düşük güvenli yorumları pozitife çek
+    Yıldız 3   → modele güven
+    """
     if star <= 2:
         return "negative"
     if star >= 4:
         if label == "negative" and score < 0.82:
             return "positive"
         return label if label != "neutral" else "positive"
+    # Yıldız 3: modele güven ama nötrü koru
     return label
 
 
 # =========================
 # DATA FETCHING
 # =========================
-import urllib.parse
-
-
 def fetch_reviews(content_id: str, max_pages: int = 25) -> pd.DataFrame:
     all_reviews = []
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "tr-TR,tr;q=0.9",
-        "Origin": "https://www.trendyol.com",
-        "Referer": "https://www.trendyol.com/"
-    }
-
     for page in range(max_pages):
-        target_url = f"https://apigw.trendyol.com/discovery-storefront-trproductgw-service/api/review-read/product-reviews/detailed?contentId={content_id}&page={page}&pageSize=20&channelId=1"
+        params = {
+            "contentId": content_id,
+            "page": page,
+            "pageSize": 20,
+            "order": "DESC",
+            "orderBy": "Score",
+            "channelId": 1,
+        }
+        resp = requests.get(API_URL, params=params, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Trendyol API hatası: {resp.status_code}")
 
-        encoded_url = urllib.parse.quote(target_url)
+        reviews = resp.json().get("result", {}).get("reviews", [])
+        if not reviews:
+            break
 
-        proxy_url = f"https://api.allorigins.win/get?url={encoded_url}"
-
-        try:
-            resp = requests.get(proxy_url, headers=headers, timeout=15)
-
-            if resp.status_code != 200:
-                break
-
-            proxy_data = resp.json()
-            actual_data = json.loads(proxy_data.get("contents", "{}"))
-
-            reviews = actual_data.get("result", {}).get("reviews", [])
-            if not reviews:
-                break
-
-            for r in reviews:
-                try:
-                    tarih = datetime.fromtimestamp(r.get("createdAt", 0) / 1000).strftime("%d.%m.%Y")
-                except:
-                    tarih = ""
-                all_reviews.append({
-                    "Kullanıcı": r.get("userFullName", ""),
-                    "Yorum": r.get("comment", ""),
-                    "Yıldız": r.get("rate", 0),
-                    "Tarih": tarih,
-                    "Beğeni": r.get("likesCount", 0),
-                    "Satıcı": r.get("seller", {}).get("name", ""),
-                })
-            time.sleep(0.5)
-        except Exception as e:
-            raise RuntimeError(f"Bağlantı Hatası: {str(e)}")
+        for r in reviews:
+            try:
+                tarih = datetime.fromtimestamp(r.get("createdAt", 0) / 1000).strftime("%d.%m.%Y")
+            except Exception:
+                tarih = ""
+            all_reviews.append({
+                "Kullanıcı": r.get("userFullName", ""),
+                "Yorum": r.get("comment", ""),
+                "Yıldız": r.get("rate", 0),
+                "Tarih": tarih,
+                "Beğeni": r.get("likesCount", 0),
+                "Satıcı": r.get("seller", {}).get("name", ""),
+            })
+        time.sleep(0.2)
 
     if not all_reviews:
-        raise RuntimeError("Trendyol güvenlik duvarı sunucu isteğini engelledi (403). Lütfen tekrar deneyin.")
+        raise RuntimeError("Bu ürün için yorum bulunamadı.")
     return pd.DataFrame(all_reviews)
+
+
 
 
 # =========================
@@ -227,8 +206,8 @@ def pick_representative_reviews(reviews: list[str], n: int = 5) -> list[str]:
     for r in filtered:
         tokens = set(metin_temizle(r).split())
         if not any(
-                len(tokens & s) / max(len(tokens | s), 1) > 0.8
-                for s in seen_tokens
+            len(tokens & s) / max(len(tokens | s), 1) > 0.8
+            for s in seen_tokens
         ):
             deduped.append(r)
             seen_tokens.append(tokens)
@@ -250,10 +229,11 @@ def pick_representative_reviews(reviews: list[str], n: int = 5) -> list[str]:
 
 
 def get_confident_reviews(df: pd.DataFrame, label: str, min_confidence: float = 0.82) -> list[str]:
+    """Sadece modelin emin olduğu yorumları döndür."""
     filtered = df[
         (df["Duygu Analizi"] == label) &
         (df["Güven Skoru"] >= min_confidence)
-        ]
+    ]
     return filtered.sort_values("Beğeni", ascending=False)["Yorum"].head(45).tolist()
 
 
@@ -312,17 +292,22 @@ def analyze_product(url: str) -> dict:
     content_id = extract_content_id(url)
     df = fetch_reviews(content_id)
 
+    # Sentiment analysis
     clean_texts = [metin_temizle(y) or "nötr" for y in df["Yorum"]]
-    results = query_sentiment_api(clean_texts)
+    pipe = get_sentiment_pipeline()
+    results = pipe(clean_texts, batch_size=32, truncation=True, max_length=128)
 
+    # Label mapping + güven skoru
     df["Duygu Analizi"] = [LABEL_MAP.get(r["label"], r["label"]) for r in results]
     df["Güven Skoru"] = [r["score"] for r in results]
 
+    # Yıldız füzyonu
     df["Duygu Analizi"] = df.apply(
         lambda row: fuse_sentiment(row["Duygu Analizi"], row["Güven Skoru"], row["Yıldız"]),
         axis=1,
     )
 
+    # Stats
     counts = df["Duygu Analizi"].value_counts()
     ratios = df["Duygu Analizi"].value_counts(normalize=True) * 100
     pos_count = int(counts.get("positive", 0))
@@ -346,14 +331,35 @@ def analyze_product(url: str) -> dict:
         "sentiment": {
             "positive": {"count": pos_count, "percent": float(ratios.get("positive", 0))},
             "negative": {"count": neg_count, "percent": float(ratios.get("negative", 0))},
-            "neutral": {"count": neu_count, "percent": float(ratios.get("neutral", 0))},
+            "neutral":  {"count": neu_count, "percent": float(ratios.get("neutral", 0))},
         },
         "featured_positive": pick_representative_reviews(pos_reviews, 4),
         "featured_negative": pick_representative_reviews(neg_reviews, 4),
+
+
+
     }
+    # =========================
+    # EXCEL EXPORT (AUTO SAVE)
+    # =========================
+    try:
+        export_dir = "exports"
+        os.makedirs(export_dir, exist_ok=True)
+
+        file_name = f"yorum_analiz_{content_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        file_path = os.path.join(export_dir, file_name)
+
+        df.to_excel(file_path, index=False)
+
+        print(f"[EXCEL] Kaydedildi -> {file_path}")
+
+    except Exception as e:
+        print(f"[EXCEL HATA] {e}")
 
     prompt = build_prompt(df, summary)
     return {"summary": summary, "prompt": prompt}
+
+
 
 
 # =========================
@@ -399,8 +405,10 @@ HTML = """<!doctype html>
     line-height: 1.5;
   }
 
+  /* ── LAYOUT ── */
   .shell { max-width: 1200px; margin: 0 auto; padding: 28px 20px 60px; }
 
+  /* ── TOPBAR ── */
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
     gap: 16px; margin-bottom: 28px;
@@ -430,6 +438,7 @@ HTML = """<!doctype html>
   .status-dot.done { background: var(--green); box-shadow: 0 0 8px var(--green); animation: none; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
+  /* ── INPUT ── */
   .input-row {
     display: flex; gap: 10px; margin-bottom: 20px;
     background: var(--surface); border: 1px solid var(--border);
@@ -455,6 +464,7 @@ HTML = """<!doctype html>
   .btn-primary:active { transform: scale(.98); }
   .btn-primary:disabled { opacity: .5; cursor: wait; }
 
+  /* ── PROGRESS ── */
   .progress-bar-wrap {
     display: none; height: 3px; background: var(--surface2);
     border-radius: 99px; margin-bottom: 20px; overflow: hidden;
@@ -470,12 +480,14 @@ HTML = """<!doctype html>
     100%{transform:translateX(300%) scaleX(.5)}
   }
 
+  /* ── NOTICE ── */
   .notice {
     display: none; padding: 12px 16px; border-radius: 8px;
     background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.3);
     color: #f85149; font-size: 13px; margin-bottom: 20px;
   }
 
+  /* ── EMPTY STATE ── */
   .empty-state {
     border: 1px dashed var(--border); border-radius: var(--radius);
     padding: 60px 32px; text-align: center; color: var(--ink3);
@@ -483,9 +495,11 @@ HTML = """<!doctype html>
   .empty-state-icon { font-size: 36px; margin-bottom: 12px; }
   .empty-state p { font-size: 14px; max-width: 360px; margin: 0 auto; }
 
+  /* ── DASHBOARD ── */
   .dashboard { display: none; }
   .dashboard.ready { display: block; }
 
+  /* ── METRICS ── */
   .metrics {
     display: grid;
     grid-template-columns: repeat(5, 1fr);
@@ -501,15 +515,16 @@ HTML = """<!doctype html>
   .metric-value { font-family: var(--mono); font-size: 28px; font-weight: 500; line-height: 1; }
   .metric-value.positive { color: var(--green); }
   .metric-value.negative { color: var(--red); }
-  .metric-value.neutral  { color: var(--ink2); }
-  .metric-value.orange   { color: var(--orange); }
+  .metric-value.orange { color: var(--orange); }
 
+  /* ── MAIN GRID ── */
   .main-grid {
     display: grid;
     grid-template-columns: 1fr 380px;
     gap: 16px;
   }
 
+  /* ── PANEL ── */
   .panel {
     background: var(--surface); border: 1px solid var(--border2);
     border-radius: var(--radius); overflow: hidden;
@@ -526,7 +541,7 @@ HTML = """<!doctype html>
   .gauge-wrap { display: flex; flex-direction: column; align-items: center; margin-bottom: 20px; }
   .gauge-svg { overflow: visible; display: block; }
   .gauge-legend {
-    display: flex; gap: 16px; margin-top: 10px; font-size: 13px; flex-wrap: wrap; justify-content: center;
+    display: flex; gap: 20px; margin-top: 10px; font-size: 13px;
   }
   .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
 
@@ -550,6 +565,7 @@ HTML = """<!doctype html>
     background: var(--bg); border-radius: 6px; border-left: 2px solid var(--border);
     line-height: 1.55; white-space: normal; word-break: break-word;
     cursor: default;
+    /* Show full text, no truncation */
   }
   .review-item.pos { border-left-color: var(--green); }
   .review-item.neg { border-left-color: var(--red); }
@@ -615,6 +631,7 @@ HTML = """<!doctype html>
   .btn-send:hover { filter: brightness(1.1); }
   .btn-send:disabled { opacity: .4; cursor: not-allowed; }
 
+  /* ── RESPONSIVE ── */
   @media (max-width: 900px) {
     .main-grid { grid-template-columns: 1fr; }
     .metrics { grid-template-columns: repeat(3, 1fr); }
@@ -631,6 +648,7 @@ HTML = """<!doctype html>
 <body>
 <div class="shell">
 
+  <!-- TOPBAR -->
   <header class="topbar">
     <div class="brand">
       <div class="brand-icon">TY</div>
@@ -645,6 +663,7 @@ HTML = """<!doctype html>
     </div>
   </header>
 
+  <!-- INPUT -->
   <div class="input-row">
     <input class="url-input" id="productUrl" type="url" placeholder="Trendyol ürün URL'sini yapıştırın…">
     <button class="btn-primary" id="analyzeBtn">Analiz Et</button>
@@ -653,13 +672,16 @@ HTML = """<!doctype html>
   <div class="progress-bar-wrap" id="progressWrap"><div class="progress-bar"></div></div>
   <div class="notice" id="notice"></div>
 
+  <!-- EMPTY STATE -->
   <div class="empty-state" id="emptyState">
     <div class="empty-state-icon">🔍</div>
     <p>Bir ürün URL'si girin — yorum dağılımı, öne çıkan müşteri görüşleri ve AI sohbet alanı burada açılacak.</p>
   </div>
 
+  <!-- DASHBOARD -->
   <div class="dashboard" id="dashboard">
 
+    <!-- METRICS -->
     <div class="metrics">
       <div class="metric">
         <div class="metric-label">Toplam Yorum</div>
@@ -678,13 +700,15 @@ HTML = """<!doctype html>
         <div class="metric-value negative" id="mNeg">—</div>
       </div>
       <div class="metric">
-        <div class="metric-label">Nötr</div>
-        <div class="metric-value neutral" id="mNeu">—</div>
+        <div class="metric-label">Güven</div>
+        <div class="metric-value orange" id="mConf">—</div>
       </div>
     </div>
 
+    <!-- MAIN GRID -->
     <div class="main-grid">
 
+      <!-- LEFT: analysis panel -->
       <div class="panel">
         <div class="panel-head">
           <h2>Duygu Analizi Raporu</h2>
@@ -692,6 +716,7 @@ HTML = """<!doctype html>
         </div>
         <div class="panel-body">
 
+          <!-- GAUGE -->
           <div class="gauge-wrap">
             <svg class="gauge-svg" width="260" height="155" viewBox="0 0 260 155">
               <defs>
@@ -699,60 +724,44 @@ HTML = """<!doctype html>
                   <stop offset="0%" style="stop-color:#2ea043"/>
                   <stop offset="100%" style="stop-color:#56d364"/>
                 </linearGradient>
-                <linearGradient id="neuGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                  <stop offset="0%" style="stop-color:#6e7681"/>
-                  <stop offset="100%" style="stop-color:#8b949e"/>
-                </linearGradient>
                 <linearGradient id="negGrad" x1="0%" y1="0%" x2="100%" y2="0%">
                   <stop offset="0%" style="stop-color:#f85149"/>
                   <stop offset="100%" style="stop-color:#da3633"/>
                 </linearGradient>
               </defs>
-
-              <!-- Track (background arc) -->
+              <!-- Full track -->
               <path fill="none" stroke="#1c2330" stroke-width="16" stroke-linecap="butt"
                     d="M25,135 A105,105 0 0,1 235,135"/>
-
-              <!-- Segment 1: Positive (green) — draws from left -->
-              <path id="gaugePos" fill="none" stroke="url(#posGrad)" stroke-width="16" stroke-linecap="butt"
+              <!-- Positive arc (left->top) -->
+              <path id="gaugePos" fill="none" stroke="url(#posGrad)" stroke-width="16" stroke-linecap="round"
                     d="M25,135 A105,105 0 0,1 235,135"
-                    style="stroke-dasharray:0 330; stroke-dashoffset:0; transition:stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1)"/>
-
-              <!-- Segment 2: Neutral (gray) — offset after positive -->
-              <path id="gaugeNeu" fill="none" stroke="url(#neuGrad)" stroke-width="16" stroke-linecap="butt"
-                    d="M25,135 A105,105 0 0,1 235,135"
-                    style="stroke-dasharray:0 330; stroke-dashoffset:0; transition:stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1) .1s, stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1) .1s"/>
-
-              <!-- Segment 3: Negative (red) — offset after positive + neutral -->
-              <path id="gaugeNeg" fill="none" stroke="url(#negGrad)" stroke-width="16" stroke-linecap="butt"
-                    d="M25,135 A105,105 0 0,1 235,135"
-                    style="stroke-dasharray:0 330; stroke-dashoffset:0; transition:stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1) .2s, stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1) .2s"/>
-
+                    style="stroke-dasharray:330; stroke-dashoffset:330; transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1)"/>
+              <!-- Negative arc (right->top, reversed) -->
+              <path id="gaugeNeg" fill="none" stroke="url(#negGrad)" stroke-width="16" stroke-linecap="round"
+                    d="M235,135 A105,105 0 0,0 25,135"
+                    style="stroke-dasharray:330; stroke-dashoffset:330; transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1) .15s"/>
               <!-- Needle -->
               <line id="gaugeNeedle" x1="130" y1="135" x2="130" y2="42"
                     stroke="#c9d1d9" stroke-width="2.5" stroke-linecap="round"
                     style="transform-origin:130px 135px; transform:rotate(-90deg); transition:transform 1.2s cubic-bezier(.4,0,.2,1) .1s"/>
               <circle cx="130" cy="135" r="5" fill="#c9d1d9"/>
-
-              <!-- Center text -->
+              <!-- Center label -->
               <text id="gaugeCenter" x="130" y="116" text-anchor="middle"
                     font-size="20" font-weight="700" fill="#e6edf3"
                     font-family="JetBrains Mono,monospace">—</text>
               <text id="gaugeSub" x="130" y="131" text-anchor="middle"
                     font-size="10" fill="#8b949e" font-family="Inter,sans-serif">olumlu</text>
-
-              <!-- Emoji anchors -->
+              <!-- Side labels -->
               <text x="8" y="151" font-size="18" fill="#8b949e">😊</text>
               <text x="228" y="151" font-size="18" fill="#8b949e">😕</text>
             </svg>
-
             <div class="gauge-legend">
               <span><span class="legend-dot" style="background:var(--green)"></span><span id="legendPos">Olumlu —</span></span>
-              <span><span class="legend-dot" style="background:var(--ink3)"></span><span id="legendNeu">Nötr —</span></span>
               <span><span class="legend-dot" style="background:var(--red)"></span><span id="legendNeg">Olumsuz —</span></span>
             </div>
           </div>
 
+          <!-- FEATURED REVIEWS -->
           <div class="review-cols">
             <div class="review-col">
               <h3 class="pos">Öne Çıkan Olumlu</h3>
@@ -767,6 +776,7 @@ HTML = """<!doctype html>
         </div>
       </div>
 
+      <!-- RIGHT: chat -->
       <div class="panel chat-panel">
         <div class="panel-head">
           <div class="chat-head-info">
@@ -835,35 +845,20 @@ function setReviewList(id, items, cls) {
   });
 }
 
-// ── THREE-SEGMENT GAUGE ──
-// Arc total length = 330 px
-// Order left→right: Positive (green) | Neutral (gray) | Negative (red)
-// Each segment uses stroke-dasharray + stroke-dashoffset to "start" at the right position.
-function animateGauge(posPercent, neuPercent, negPercent) {
-  const ARC = 330;
+function animateGauge(posPercent, negPercent) {
+  const ARC_LEN = 330;
 
-  const posLen = (posPercent / 100) * ARC;
-  const neuLen = (neuPercent / 100) * ARC;
-  const negLen = (negPercent / 100) * ARC;
+  // Positive: left side fills proportionally
+  const posOffset = ARC_LEN - (posPercent / 100) * ARC_LEN;
+  // Negative: right side fills proportionally
+  const negOffset = ARC_LEN - (negPercent / 100) * ARC_LEN;
 
   setTimeout(() => {
-    // Segment 1 — Positive: starts at 0, length = posLen
-    const elPos = document.getElementById('gaugePos');
-    elPos.style.strokeDasharray  = `${posLen} ${ARC - posLen}`;
-    elPos.style.strokeDashoffset = '0';
+    document.getElementById('gaugePos').style.strokeDashoffset = posOffset;
+    document.getElementById('gaugeNeg').style.strokeDashoffset = negOffset;
 
-    // Segment 2 — Neutral: starts after positive segment
-    // dashoffset = -(posLen) shifts the drawn dash forward by posLen
-    const elNeu = document.getElementById('gaugeNeu');
-    elNeu.style.strokeDasharray  = `${neuLen} ${ARC - neuLen}`;
-    elNeu.style.strokeDashoffset = `${-posLen}`;
-
-    // Segment 3 — Negative: starts after positive + neutral
-    const elNeg = document.getElementById('gaugeNeg');
-    elNeg.style.strokeDasharray  = `${negLen} ${ARC - negLen}`;
-    elNeg.style.strokeDashoffset = `${-(posLen + neuLen)}`;
-
-    // Needle: -90deg = full left (all positive), 0deg = center, +90deg = full right (all negative)
+    // Needle: -90deg = full left (100% pos), +90deg = full right (100% neg)
+    // Map posPercent 0-100 to angle -90 to +90
     const angle = ((negPercent - posPercent) / 100) * 90;
     document.getElementById('gaugeNeedle').style.transform = `rotate(${angle}deg)`;
 
@@ -872,7 +867,6 @@ function animateGauge(posPercent, neuPercent, negPercent) {
   }, 100);
 
   $('legendPos').textContent = `Olumlu %${posPercent.toFixed(1)}`;
-  $('legendNeu').textContent = `Nötr %${neuPercent.toFixed(1)}`;
   $('legendNeg').textContent = `Olumsuz %${negPercent.toFixed(1)}`;
 }
 
@@ -880,19 +874,18 @@ function renderDashboard(data) {
   const s = data.summary;
   const sent = s.sentiment;
 
-  $('mTotal').textContent  = s.total_reviews.toLocaleString('tr');
+  $('mTotal').textContent = s.total_reviews.toLocaleString('tr');
   $('mRating').textContent = s.average_rating.toFixed(2);
-  $('mPos').textContent    = `%${sent.positive.percent.toFixed(1)}`;
-  $('mNeg').textContent    = `%${sent.negative.percent.toFixed(1)}`;
-  $('mNeu').textContent    = `%${sent.neutral.percent.toFixed(1)}`;
+  $('mPos').textContent = `%${sent.positive.percent.toFixed(1)}`;
+  $('mNeg').textContent = `%${sent.negative.percent.toFixed(1)}`;
+  $('mConf').textContent = `%${s.confidence_score.toFixed(1)}`;
   $('productIdLabel').textContent = `ID: ${s.content_id}`;
 
-  // Pass all three values — neutral is now shown on gauge
-  animateGauge(sent.positive.percent, sent.neutral.percent, sent.negative.percent);
-
+  animateGauge(sent.positive.percent, sent.negative.percent);
   setReviewList('posReviews', s.featured_positive, 'pos');
   setReviewList('negReviews', s.featured_negative, 'neg');
 
+  // unlock chat
   chatLog.innerHTML = '';
   addMsg('bot', 'Analiz tamamlandı! Bu ürünün yorumlarına dayanarak soru sorabilirsin. 💬');
   chatInput.disabled = false;
@@ -943,9 +936,7 @@ async function sendMessage() {
   if (!q) return;
   addMsg('user', q);
   chatInput.value = '';
-  chatInput.disabled = true;
   sendBtn.disabled = true;
-
   const pending = addMsg('bot typing', 'Yanıt hazırlanıyor…');
 
   try {
@@ -962,7 +953,6 @@ async function sendMessage() {
     pending.className = 'msg bot';
     pending.textContent = '⚠️ ' + e.message;
   } finally {
-    chatInput.disabled = false;
     sendBtn.disabled = false;
     chatInput.focus();
     chatLog.scrollTop = chatLog.scrollHeight;
@@ -994,7 +984,7 @@ def api_analyze():
 
     payload = request.get_json(silent=True) or {}
     url = payload.get("url", "").strip()
-    if (url == " "):
+    if not url:
         return jsonify({"error": "URL boş olamaz."}), 400
 
     try:
@@ -1032,15 +1022,21 @@ def api_chat():
         )
         return jsonify({"answer": res.choices[0].message.content})
     except Exception as exc:
+        import traceback
+
+        print("\n" + "=" * 80)
+        traceback.print_exc()
+        print("=" * 80)
+        print("Exception type:", type(exc))
+        print("Exception repr:", repr(exc))
+        print("=" * 80)
+
         return jsonify({"error": str(exc)}), 400
 
 
 if __name__ == "__main__":
-    import os
-
-    # Render'ın atayacağı dinamik portu alıyoruz
-    port = int(os.environ.get("PORT", 5000))
-
-    print("Uygulama ayağa kalkıyor...")
-    # Olmayan fonksiyon çağrılarını sildik, direkt Flask'ı başlatıyoruz
-    app.run(debug=False, host="0.0.0.0", port=port, use_reloader=False)
+    # Pre-load sentiment pipeline at startup to avoid first-request delay
+    print("Sentiment modeli yükleniyor…")
+    get_sentiment_pipeline()
+    print("Model hazır.")
+    app.run(debug=False, host="127.0.0.1", port=5000, use_reloader=False)
