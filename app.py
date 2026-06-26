@@ -130,6 +130,16 @@ def fuse_sentiment(label: str, score: float, star: int) -> str:
 # =========================
 def fetch_reviews(content_id: str, max_pages: int = 25) -> pd.DataFrame:
     all_reviews = []
+
+    # Trendyol'un veri merkezi IP'lerini engellemesini zorlaştırmak için gerçekçi tarayıcı bilgileri ekliyoruz
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://www.trendyol.com",
+        "Referer": "https://www.trendyol.com/"
+    }
+
     for page in range(max_pages):
         params = {
             "contentId": content_id,
@@ -139,8 +149,13 @@ def fetch_reviews(content_id: str, max_pages: int = 25) -> pd.DataFrame:
             "orderBy": "Score",
             "channelId": 1,
         }
-        resp = requests.get(API_URL, params=params, timeout=20)
-        if resp.status_code != 200:
+
+        # İstek atarken headers parametresini ekledik
+        resp = requests.get(API_URL, params=params, headers=headers, timeout=20)
+
+        if resp.status_code == 403:
+            raise RuntimeError("Trendyol güvenlik duvarı sunucu isteğini engelledi (403). Lütfen tekrar deneyin.")
+        elif resp.status_code != 200:
             raise RuntimeError(f"Trendyol API hatası: {resp.status_code}")
 
         reviews = resp.json().get("result", {}).get("reviews", [])
@@ -160,7 +175,7 @@ def fetch_reviews(content_id: str, max_pages: int = 25) -> pd.DataFrame:
                 "Beğeni": r.get("likesCount", 0),
                 "Satıcı": r.get("seller", {}).get("name", ""),
             })
-        time.sleep(0.2)
+        time.sleep(0.3)  # Engellenme riskini azaltmak için bekleme süresini hafifçe artırdık
 
     if not all_reviews:
         raise RuntimeError("Bu ürün için yorum bulunamadı.")
@@ -1018,4 +1033,11 @@ def api_chat():
 
 
 if __name__ == "__main__":
-    app.run(debug=False, host="127.0.0.1", port=5000, use_reloader=False)
+    import os
+
+    # Render'ın atayacağı dinamik portu alıyoruz
+    port = int(os.environ.get("PORT", 5000))
+
+    print("Uygulama ayağa kalkıyor...")
+    # Olmayan fonksiyon çağrılarını sildik, direkt Flask'ı başlatıyoruz
+    app.run(debug=False, host="0.0.0.0", port=port, use_reloader=False)
